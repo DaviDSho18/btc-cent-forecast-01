@@ -1,58 +1,72 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-interface ForecastCase {
+type Market = {
+  id?: string;
+  prices?: unknown[];
+};
+
+type ForecastCase = {
   case: string;
-  markets: Array<{ id: string; prices: unknown }>;
-}
+  markets?: Market[];
+};
 
+// Documented 90/10 blend of the last price and recent mean.
+const MEAN_WEIGHT = 0.1;
+const WINDOW_SIZE = 60;
 const MIN_PRICE = 0.00001;
 const MAX_PRICE = 9_999_999.99999;
-const EMPTY_HISTORY_PRICE = 1;
-const WINDOW_SIZE = 60;
+const EMPTY_PRICE = 1;
 
-function forecast(prices: unknown): number {
-  // Invalid observations do not count toward the 60-price window.
-  const recent: number[] = [];
-  if (Array.isArray(prices)) {
-    for (let i = prices.length - 1; i >= 0 && recent.length < WINDOW_SIZE; i--) {
-      const price: unknown = prices[i];
-      if (typeof price === "number" && Number.isFinite(price)) {
-        recent.push(price);
-      }
+function isUsablePrice(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function forecast(prices: unknown[]): number {
+  let last: number | undefined;
+  for (let i = prices.length - 1; i >= 0; i--) {
+    const price = prices[i];
+    if (isUsablePrice(price)) {
+      last = price;
+      break;
     }
   }
+  if (last === undefined) return EMPTY_PRICE;
 
-  if (recent.length === 0) return EMPTY_HISTORY_PRICE;
-
-  // Divide before summing to avoid overflowing a sum of large finite prices.
-  const mean = recent.reduce((sum, price) => sum + price / recent.length, 0);
-  const guess = 0.9 * recent[0] + 0.1 * mean;
-  const bounded = Math.max(MIN_PRICE, Math.min(MAX_PRICE, guess));
-  return Number(bounded.toFixed(5));
+  // Keep the window chronological: invalid entries must not pull in older minutes.
+  const recent = prices.slice(-WINDOW_SIZE).filter(isUsablePrice);
+  // Normalize before summing to avoid overflow even for extreme finite inputs.
+  const scale = recent.length > 0 ? Math.max(...recent) : last;
+  const normalizedMean = recent.reduce((sum, price) => sum + price / scale, 0)
+    / Math.max(1, recent.length);
+  const mean = recent.length > 0 ? Math.min(1, normalizedMean) * scale : last;
+  const guess = (1 - MEAN_WEIGHT) * last + MEAN_WEIGHT * mean;
+  return Math.max(MIN_PRICE, Math.min(MAX_PRICE, guess));
 }
 
 function main(): void {
-  const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input/";
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output/";
+  const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input/';
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output/';
   mkdirSync(outputDir, { recursive: true });
 
-  // Default string sorting is deterministic and independent of the locale.
-  const filenames = readdirSync(inputDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".in"))
+  const files = readdirSync(inputDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.in'))
     .map((entry) => entry.name)
     .sort();
 
-  for (const filename of filenames) {
-    const input = JSON.parse(readFileSync(join(inputDir, filename), "utf8")) as ForecastCase;
-    const market = input.markets.find((entry) => entry.id === "btc-usdc");
-    const price = forecast(market?.prices);
+  for (const filename of files) {
+    const input: ForecastCase = JSON.parse(readFileSync(join(inputDir, filename), 'utf8'));
+    if (typeof input.case !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(input.case)) {
+      throw new Error(`Invalid case ID in ${filename}`);
+    }
 
-    // Keep the input filename stem; the case identifier comes from the JSON.
-    const outputPath = join(outputDir, `${filename.slice(0, -3)}.out`);
-    // Embed a fixed-point numeric literal, not a quoted string, to retain five decimals.
-    const output = `{"forecasts":[{"case":${JSON.stringify(input.case)},"price":${price.toFixed(5)}}]}\n`;
-    writeFileSync(outputPath, output, "utf8");
+    const markets = Array.isArray(input.markets) ? input.markets : [];
+    const market = markets.find((entry) => entry?.id === 'btc-usdc') ?? markets[0];
+    const prices = Array.isArray(market?.prices) ? market.prices : [];
+    const price = forecast(prices).toFixed(5);
+    // Emit a JSON number (not a string), preserving five decimal places on disk.
+    const output = `{"forecasts":[{"case":${JSON.stringify(input.case)},"price":${price}}]}\n`;
+    writeFileSync(join(outputDir, `${input.case}.out`), output, 'utf8');
   }
 }
 
